@@ -1,0 +1,241 @@
+import { NextRequest } from "next/server";
+import { z } from "zod";
+import { buildSystemPrompt } from "@/lib/server/system-prompt";
+import { checkRateLimit } from "@/lib/server/rate-limit";
+import type { ChatErrorCode } from "@/types/chat";
+
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+const MAX_BODY_BYTES = 80_000;
+const MAX_MESSAGE_LENGTH = 12_000;
+const MAX_TOTAL_CONTENT = 60_000;
+const REQUEST_TIMEOUT_MS = 70_000;
+
+const requestSchema = z.object({
+  messages: z
+    .array(
+      z.object({
+        role: z.enum(["user", "assistant"]),
+        content: z.string().trim().min(1).max(MAX_MESSAGE_LENGTH)
+      })
+    )
+    .min(1)
+    .max(40),
+  language: z.enum(["az", "tr", "en", "ru"]),
+  responseStyle: z.enum(["concise", "balanced", "detailed"])
+});
+
+type ErrorPayload = { code: ChatErrorCode; message: string };
+
+function errorResponse(code: ChatErrorCode, message: string, status: number, headers?: HeadersInit) {
+  return Response.json(
+    { code, message } satisfies ErrorPayload,
+    {
+      status,
+      headers: {
+        "Cache-Control": "no-store",
+        ...headers
+      }
+    }
+  );
+}
+
+function getClientKey(request: NextRequest) {
+  const forwarded = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim();
+  const realIp = request.headers.get("x-real-ip")?.trim();
+  return forwarded || realIp || "anonymous";
+}
+
+function friendlyProviderError(status: number): ErrorPayload {
+  if (status === 401 || status === 403) {
+    return { code: "INVALID_API_KEY", message: "The AI service credentials are invalid." };
+  }
+  if (status === 429) {
+    return { code: "RATE_LIMITED", message: "The AI service rate limit was reached." };
+  }
+  if (status === 408 || status === 504) {
+    return { code: "REQUEST_TIMEOUT", message: "The AI service request timed out." };
+  }
+  if (status >= 500) {
+    return { code: "PROVIDER_UNAVAILABLE", message: "The AI service is temporarily unavailable." };
+  }
+  return { code: "SERVER_ERROR", message: "The request could not be completed." };
+}
+
+function parseSseLine(line: string) {
+  if (!line.startsWith("data:")) return null;
+  const data = line.slice(5).trim();
+  if (!data || data === "[DONE]") return null;
+  try {
+    const parsed = JSON.parse(data) as {
+      choices?: Array<{ delta?: { content?: string | null } }>;
+    };
+    return parsed.choices?.[0]?.delta?.content ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function POST(request: NextRequest) {
+  const contentType = request.headers.get("content-type") ?? "";
+  if (!contentType.toLowerCase().includes("application/json")) {
+    return errorResponse("INVALID_REQUEST", "Expected a JSON request body.", 415);
+  }
+
+  const contentLength = Number(request.headers.get("content-length") ?? "0");
+  if (Number.isFinite(contentLength) && contentLength > MAX_BODY_BYTES) {
+    return errorResponse("MESSAGE_TOO_LONG", "The request body is too large.", 413);
+  }
+
+  const rate = checkRateLimit(getClientKey(request));
+  if (!rate.allowed) {
+    return errorResponse("RATE_LIMITED", "Too many requests.", 429, {
+      "Retry-After": String(Math.max(1, Math.ceil((rate.resetAt - Date.now()) / 1000)))
+    });
+  }
+
+  const apiKey = process.env.GROQ_API_KEY?.trim();
+  const model = process.env.AI_MODEL?.trim();
+  if (!apiKey || !model) {
+    return errorResponse("MISSING_API_KEY", "The server AI configuration is incomplete.", 503);
+  }
+
+  let rawBody: unknown;
+  try {
+    rawBody = await request.json();
+  } catch {
+    return errorResponse("INVALID_REQUEST", "The JSON request body is invalid.", 400);
+  }
+
+  const parsed = requestSchema.safeParse(rawBody);
+  if (!parsed.success) {
+    const tooLong = parsed.error.issues.some((issue) => issue.code === "too_big");
+    return errorResponse(
+      tooLong ? "MESSAGE_TOO_LONG" : "INVALID_REQUEST",
+      tooLong ? "One or more messages exceed the allowed length." : "The request structure is invalid.",
+      tooLong ? 413 : 400
+    );
+  }
+
+  const totalLength = parsed.data.messages.reduce((sum, message) => sum + message.content.length, 0);
+  if (totalLength > MAX_TOTAL_CONTENT) {
+    return errorResponse("MESSAGE_TOO_LONG", "The conversation is too long for one request.", 413);
+  }
+
+  if (parsed.data.messages.at(-1)?.role !== "user") {
+    return errorResponse("INVALID_REQUEST", "The final message must be from the user.", 400);
+  }
+
+  const timeoutController = new AbortController();
+  const timeoutId = setTimeout(() => timeoutController.abort(), REQUEST_TIMEOUT_MS);
+  const abortFromClient = () => timeoutController.abort();
+  request.signal.addEventListener("abort", abortFromClient, { once: true });
+
+  let upstream: Response;
+  try {
+    upstream = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+        Accept: "text/event-stream"
+      },
+      body: JSON.stringify({
+        model,
+        stream: true,
+        temperature: 0.55,
+        messages: [
+          { role: "system", content: buildSystemPrompt(parsed.data.language, parsed.data.responseStyle) },
+          ...parsed.data.messages
+        ]
+      }),
+      signal: timeoutController.signal,
+      cache: "no-store"
+    });
+  } catch (error) {
+    clearTimeout(timeoutId);
+    request.signal.removeEventListener("abort", abortFromClient);
+    if (error instanceof Error && error.name === "AbortError") {
+      return errorResponse("REQUEST_TIMEOUT", "The AI request timed out.", 504);
+    }
+    return errorResponse("NETWORK_ERROR", "The AI service could not be reached.", 502);
+  }
+
+  if (!upstream.ok || !upstream.body) {
+    clearTimeout(timeoutId);
+    request.signal.removeEventListener("abort", abortFromClient);
+    const mapped = friendlyProviderError(upstream.status);
+    return errorResponse(mapped.code, mapped.message, upstream.status === 429 ? 429 : 502);
+  }
+
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let emittedText = false;
+
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const reader = upstream.body!.getReader();
+      try {
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n");
+          buffer = lines.pop() ?? "";
+
+          for (const rawLine of lines) {
+            const text = parseSseLine(rawLine.trim());
+            if (!text) continue;
+            emittedText = true;
+            controller.enqueue(encoder.encode(`event: delta\ndata: ${JSON.stringify({ text })}\n\n`));
+          }
+        }
+
+        if (buffer.trim()) {
+          const text = parseSseLine(buffer.trim());
+          if (text) {
+            emittedText = true;
+            controller.enqueue(encoder.encode(`event: delta\ndata: ${JSON.stringify({ text })}\n\n`));
+          }
+        }
+
+        if (!emittedText) {
+          controller.enqueue(
+            encoder.encode(`event: error\ndata: ${JSON.stringify({ code: "EMPTY_RESPONSE" })}\n\n`)
+          );
+        } else {
+          controller.enqueue(encoder.encode("event: done\ndata: {}\n\n"));
+        }
+      } catch (error) {
+        if (!(error instanceof Error && error.name === "AbortError")) {
+          controller.enqueue(
+            encoder.encode(`event: error\ndata: ${JSON.stringify({ code: "NETWORK_ERROR" })}\n\n`)
+          );
+        }
+      } finally {
+        clearTimeout(timeoutId);
+        request.signal.removeEventListener("abort", abortFromClient);
+        reader.releaseLock();
+        controller.close();
+      }
+    },
+    cancel() {
+      timeoutController.abort();
+      clearTimeout(timeoutId);
+      request.signal.removeEventListener("abort", abortFromClient);
+    }
+  });
+
+  return new Response(stream, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/event-stream; charset=utf-8",
+      "Cache-Control": "no-cache, no-store, must-revalidate",
+      Connection: "keep-alive",
+      "X-Accel-Buffering": "no",
+      "X-RateLimit-Remaining": String(rate.remaining)
+    }
+  });
+}
